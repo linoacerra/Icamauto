@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>AutoEnhance Neural Camera</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; -webkit-touch-callout: none; -webkit-user-select: none; }
+    body {
+      background: #000;
+      color: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      overflow: hidden;
+      height: 100vh;
+      display: flex;
+    }
+    #viewport { width: 100vw; height: 100vh; object-fit: cover; }
+    
+    .hud-pill {
+      position: absolute;
+      top: calc(env(safe-area-inset-top, 20px) + 12px);
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(18, 18, 20, 0.75);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border: 0.5px solid rgba(255, 255, 255, 0.15);
+      padding: 8px 18px;
+      border-radius: 30px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 13px;
+      font-weight: 500;
+      pointer-events: none;
+      z-index: 10;
+      white-space: nowrap;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    }
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #34c759;
+      box-shadow: 0 0 10px #34c759;
+    }
+    .status-dot.recording {
+      background: #ff3b30;
+      box-shadow: 0 0 12px #ff3b30;
+      animation: rec-pulse 1s infinite;
+    }
+    @keyframes rec-pulse {
+      0%, 100% { transform: scale(1); opacity: 1; }
+      50% { transform: scale(1.3); opacity: 0.5; }
+    }
+
+    .bottom-bar {
+      position: absolute;
+      bottom: calc(env(safe-area-inset-bottom, 20px) + 24px);
+      left: 0;
+      right: 0;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      z-index: 10;
+    }
+    .record-btn-outer {
+      width: 76px;
+      height: 76px;
+      border: 4px solid #fff;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      background: rgba(0,0,0,0.2);
+      backdrop-filter: blur(10px);
+      transition: transform 0.15s ease;
+    }
+    .record-btn-outer:active { transform: scale(0.92); }
+    .record-btn-inner {
+      width: 60px;
+      height: 60px;
+      background: #ff3b30;
+      border-radius: 50%;
+      transition: all 0.25s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+    }
+    .record-btn-outer.is-recording .record-btn-inner {
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="hud-pill">
+    <div class="status-dot" id="statusDot"></div>
+    <span id="statusText">Inizializzazione...</span>
+  </div>
+
+  <canvas id="viewport"></canvas>
+  <video id="videoFeed" playsinline autoplay muted style="display:none;"></video>
+
+  <div class="bottom-bar">
+    <div class="record-btn-outer" id="recordBtn" onclick="toggleRecording()">
+      <div class="record-btn-inner"></div>
+    </div>
+  </div>
+
+  <script>
+    const canvas = document.getElementById('viewport');
+    const gl = canvas.getContext('webgl', { premultipliedAlpha: false, alpha: false, antialias: false });
+    const video = document.getElementById('videoFeed');
+    const statusText = document.getElementById('statusText');
+    const statusDot = document.getElementById('statusDot');
+    const recordBtn = document.getElementById('recordBtn');
+
+    const probeCanvas = document.createElement('canvas');
+    probeCanvas.width = 16;
+    probeCanvas.height = 16;
+    const probeCtx = probeCanvas.getContext('2d', { willReadFrequently: true });
+
+    const vsSource = `
+      attribute vec2 aPosition;
+      varying vec2 vTexCoord;
+      void main() {
+        vTexCoord = (aPosition + 1.0) * 0.5;
+        vTexCoord.y = 1.0 - vTexCoord.y;
+        gl_Position = vec4(aPosition, 0.0, 1.0);
+      }
+    `;
+
+    const fsSource = `
+      precision mediump float;
+      varying vec2 vTexCoord;
+      uniform sampler2D uTexture;
+      uniform sampler2D uPrevTexture;
+      uniform vec2 uTexelSize;
+      uniform float uExposure;
+      uniform float uGamma;
+      uniform vec3 uColorBalance;
+      uniform float uSharpness;
+      uniform float uDenoiseStrength;
+      uniform float uColorSigma;
+      uniform float uTemporalAlpha;
+
+      void main() {
+        vec4 center = texture2D(uTexture, vTexCoord);
+
+        if (uDenoiseStrength > 0.05) {
+          vec3 sumColor = vec3(0.0);
+          float sumWeight = 0.0;
+          for (int x = -2; x <= 2; x++) {
+            for (int y = -2; y <= 2; y++) {
+              vec2 offset = vec2(float(x), float(y)) * uTexelSize;
+              vec4 neighbor = texture2D(uTexture, vTexCoord + offset);
+              float distSpatial = float(x*x + y*y);
+              float wSpatial = exp(-distSpatial / 8.0);
+              vec3 diff = center.rgb - neighbor.rgb;
+              float distColor = dot(diff, diff);
+              float wColor = exp(-distColor / (2.0 * uColorSigma * uColorSigma));
+              float w = wSpatial * wColor;
+              sumColor += neighbor.rgb * w;
+              sumWeight += w;
+            }
+          }
+          center.rgb = mix(center.rgb, sumColor / max(sumWeight, 0.0001), uDenoiseStrength);
+        }
+
+        vec3 prev = texture2D(uPrevTexture, vTexCoord).rgb;
+        float lumC = dot(center.rgb, vec3(0.299, 0.587, 0.114));
+        float lumP = dot(prev, vec3(0.299, 0.587, 0.114));
+        float motion = abs(lumC - lumP);
+        float effectiveAlpha = mix(uTemporalAlpha, 1.0, smoothstep(0.02, 0.10, motion));
+        vec3 blended = mix(prev, center.rgb, effectiveAlpha);
+
+        vec4 top    = texture2D(uTexture, vTexCoord + vec2(0.0, uTexelSize.y));
+        vec4 bottom = texture2D(uTexture, vTexCoord - vec2(0.0, uTexelSize.y));
+        vec4 left   = texture2D(uTexture, vTexCoord - vec2(uTexelSize.x, 0.0));
+        vec4 right  = texture2D(uTexture, vTexCoord + vec2(uTexelSize.x, 0.0));
+        vec3 laplacian = blended * 5.0 - (top.rgb + bottom.rgb + left.rgb + right.rgb);
+        vec3 sharpColor = mix(blended, laplacian, uSharpness);
+
+        sharpColor *= uColorBalance;
+        sharpColor *= uExposure;
+        sharpColor = pow(max(sharpColor, vec3(0.0)), vec3(1.0 / uGamma));
+
+        float lum = dot(sharpColor, vec3(0.299, 0.587, 0.114));
+        vec3 finalColor = mix(vec3(lum), sharpColor, 1.12);
+
+        gl_FragColor = vec4(clamp(finalColor, 0.0, 1.0), 1.0);
+      }
+    `;
+
+    function buildShader(gl, type, src) {
+      const s = gl.createShader(type);
+      gl.shaderSource(s, src);
+      gl.compileShader(s);
+      return s;
+    }
+
+    const program = gl.createProgram();
+    gl.attachShader(program, buildShader(gl, gl.VERTEX_SHADER, vsSource));
+    gl.attachShader(program, buildShader(gl, gl.FRAGMENT_SHADER, fsSource));
+    gl.linkProgram(program);
+    gl.useProgram(program);
+
+    const quadBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, -1,1, 1,-1, 1,1]), gl.STATIC_DRAW);
+
+    const aPos = gl.getAttribLocation(program, 'aPosition');
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+    const uLocs = {
+      texture: gl.getUniformLocation(program, 'uTexture'),
+      prevTexture: gl.getUniformLocation(program, 'uPrevTexture'),
+      texelSize: gl.getUniformLocation(program, 'uTexelSize'),
+      exposure: gl.getUniformLocation(program, 'uExposure'),
+      gamma: gl.getUniformLocation(program, 'uGamma'),
+      colorBalance: gl.getUniformLocation(program, 'uColorBalance'),
+      sharpness: gl.getUniformLocation(program, 'uSharpness'),
+      denoiseStrength: gl.getUniformLocation(program, 'uDenoiseStrength'),
+      colorSigma: gl.getUniformLocation(program, 'uColorSigma'),
+      temporalAlpha: gl.getUniformLocation(program, 'uTemporalAlpha')
+    };
+
+    const videoTexture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, videoTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+    let fboA, fboB, texA, texB;
+    let isPing = true;
+
+    function initFBOs(w, h) {
+      function make() {
+        const tex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        const fbo = gl.createFramebuffer();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+        return { fbo, tex };
+      }
+      const p1 = make(); const p2 = make();
+      fboA = p1.fbo; texA = p1.tex;
+      fboB = p2.fbo; texB = p2.tex;
+    }
+
+    const state = { exposure: 1.0, gamma: 1.0, colorBalance: [1.0, 1.0, 1.0], sharpness: 0.2, denoiseStrength: 0.0, colorSigma: 0.15, temporalAlpha: 0.25 };
+    const target = { ...state, colorBalance: [1.0, 1.0, 1.0] };
+
+    async function startCamera() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+          video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } }
+        });
+        video.srcObject = stream;
+        await video.play();
+
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        gl.viewport(0, 0, canvas.width, canvas.height);
+        gl.uniform2f(uLocs.texelSize, 1.0 / canvas.width, 1.0 / canvas.height);
+        initFBOs(canvas.width, canvas.height);
+        statusText.innerText = "Ottimizzazione Attiva";
+      } catch (err) {
+        statusText.innerText = "Camera non attiva (Serve HTTPS)";
+        statusDot.style.background = "#ff3b30";
+      }
+    }
+
+    setInterval(() => {
+      if (!video.videoWidth || isRecordingState) return;
+      probeCtx.drawImage(video, 0, 0, 16, 16);
+      const data = probeCtx.getImageData(0, 0, 16, 16).data;
+      let sumR = 0, sumG = 0, sumB = 0, sumLum = 0, shadowCount = 0, highCount = 0;
+      const count = 256;
+
+      for (let i = 0; i < data.length; i += 4) {
+        const r = data[i], g = data[i+1], b = data[i+2];
+        const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+        sumR += r; sumG += g; sumB += b; sumLum += lum;
+        if (lum < 35) shadowCount++;
+        if (lum > 215) highCount++;
+      }
+
+      const avgLum = sumLum / count;
+      const avgR = (sumR / count) || 1;
+      const avgG = (sumG / count) || 1;
+      const avgB = (sumB / count) || 1;
+      const avgGray = (avgR + avgG + avgB) / 3;
+
+      if (avgLum < 55) {
+        target.exposure = 1.45; target.gamma = 0.58; target.denoiseStrength = 0.85;
+        target.colorSigma = 0.25; target.sharpness = 0.08; target.temporalAlpha = 0.18;
+        statusText.innerText = "🌙 Notte (Denoise Attivo)";
+      } else if (shadowCount / count > 0.20 && highCount / count > 0.10) {
+        target.exposure = 1.15; target.gamma = 0.68; target.denoiseStrength = 0.2;
+        target.colorSigma = 0.12; target.sharpness = 0.30; target.temporalAlpha = 0.35;
+        statusText.innerText = "⚡ Controluce HDR";
+      } else {
+        target.exposure = 1.02; target.gamma = 0.92; target.denoiseStrength = 0.0;
+        target.colorSigma = 0.10; target.sharpness = 0.28; target.temporalAlpha = 0.50;
+        statusText.innerText = "✨ Bilanciamento Ottimale";
+      }
+
+      target.colorBalance = [
+        Math.min(1.25, Math.max(0.80, avgGray / avgR)),
+        Math.min(1.25, Math.max(0.80, avgGray / avgG)),
+        Math.min(1.25, Math.max(0.80, avgGray / avgB))
+      ];
+    }, 100);
+
+    let mediaRecorder = null;
+    let recordedChunks = [];
+    let isRecordingState = false;
+    let recordStartTime = 0;
+    let timerInterval = null;
+
+    function getSupportedMimeType() {
+      const types = ['video/mp4;codecs=avc1', 'video/mp4', 'video/webm;codecs=h264', 'video/webm'];
+      return types.find(t => MediaRecorder.isTypeSupported(t)) || '';
+    }
+
+    async function toggleRecording() {
+      if (!isRecordingState) startRecording();
+      else stopRecording();
+    }
+
+    function startRecording() {
+      recordedChunks = [];
+      const canvasStream = canvas.captureStream(60);
+      if (video.srcObject && video.srcObject.getAudioTracks().length > 0) {
+        canvasStream.addTrack(video.srcObject.getAudioTracks()[0]);
+      }
+
+      const mimeType = getSupportedMimeType();
+      const options = mimeType ? { mimeType, videoBitsPerSecond: 12000000 } : {};
+
+      try { mediaRecorder = new MediaRecorder(canvasStream, options); }
+      catch (e) { mediaRecorder = new MediaRecorder(canvasStream); }
+
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) recordedChunks.push(e.data);
+      };
+
+      mediaRecorder.onstop = exportVideo;
+      mediaRecorder.start(250);
+      isRecordingState = true;
+      recordBtn.classList.add('is-recording');
+      statusDot.classList.add('recording');
+
+      recordStartTime = Date.now();
+      timerInterval = setInterval(() => {
+        const sec = Math.floor((Date.now() - recordStartTime) / 1000);
+        const m = String(Math.floor(sec / 60)).padStart(2, '0');
+        const s = String(sec % 60).padStart(2, '0');
+        statusText.innerText = `REC ${m}:${s}`;
+      }, 1000);
+    }
+
+    function stopRecording() {
+      if (!mediaRecorder || mediaRecorder.state === 'inactive') return;
+      mediaRecorder.stop();
+      isRecordingState = false;
+      recordBtn.classList.remove('is-recording');
+      statusDot.classList.remove('recording');
+      clearInterval(timerInterval);
+      statusText.innerText = "Elaborazione file...";
+    }
+
+    async function exportVideo() {
+      const mime = mediaRecorder.mimeType || 'video/mp4';
+      const ext = mime.includes('mp4') ? 'mp4' : 'webm';
+      const blob = new Blob(recordedChunks, { type: mime });
+      const file = new File([blob], `Enhanced_${Date.now()}.${ext}`, { type: mime });
+
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        try {
+          await navigator.share({
+            files: [file],
+            title: 'Video Migliorato AI',
+            text: 'Video elaborato con successo.'
+          });
+          statusText.innerText = "Video salvato con successo";
+        } catch (err) {
+          if (err.name !== 'AbortError') fallbackDownload(blob, file.name);
+          else statusText.innerText = "Salvataggio annullato";
+        }
+      } else {
+        fallbackDownload(blob, file.name);
+      }
+    }
+
+    function fallbackDownload(blob, fileName) {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+      statusText.innerText = "Download completato";
+    }
+
+    function render() {
+      if (video.readyState >= video.HAVE_CURRENT_DATA) {
+        const k = 0.08;
+        state.exposure += (target.exposure - state.exposure) * k;
+        state.gamma += (target.gamma - state.gamma) * k;
+        state.sharpness += (target.sharpness - state.sharpness) * k;
+        state.denoiseStrength += (target.denoiseStrength - state.denoiseStrength) * k;
+        state.colorSigma += (target.colorSigma - state.colorSigma) * k;
+        state.temporalAlpha += (target.temporalAlpha - state.temporalAlpha) * k;
+        state.colorBalance[0] += (target.colorBalance[0] - state.colorBalance[0]) * k;
+        state.colorBalance[1] += (target.colorBalance[1] - state.colorBalance[1]) * k;
+        state.colorBalance[2] += (target.colorBalance[2] - state.colorBalance[2]) * k;
+
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, videoTexture);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+        gl.uniform1i(uLocs.texture, 0);
+
+        const readTex = isPing ? texA : texB;
+        const writeFbo = isPing ? fboB : fboA;
+
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, readTex);
+        gl.uniform1i(uLocs.prevTexture, 1);
+
+        gl.uniform1f(uLocs.exposure, state.exposure);
+        gl.uniform1f(uLocs.gamma, state.gamma);
+        gl.uniform3fv(uLocs.colorBalance, state.colorBalance);
+        gl.uniform1f(uLocs.sharpness, state.sharpness);
+        gl.uniform1f(uLocs.denoiseStrength, state.denoiseStrength);
+        gl.uniform1f(uLocs.colorSigma, state.colorSigma);
+        gl.uniform1f(uLocs.temporalAlpha, state.temporalAlpha);
+
+        gl.bindFramebuffer(gl.FRAMEBUFFER, writeFbo);
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+        isPing = !isPing;
+      }
+      requestAnimationFrame(render);
+    }
+
+    window.addEventListener('DOMContentLoaded', () => {
+      startCamera();
+      requestAnimationFrame(render);
+    });
+  </script>
+</body>
+</html>
